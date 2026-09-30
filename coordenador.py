@@ -62,23 +62,90 @@ class ReplicaClient:
     def write(self, index: int, key: str, value) -> ReplicaResponse:
         return self._request(index, "/write", {"chave": key, "valor": value})
 
+    def is_healthy(self, index: int) -> bool:
+        try:
+            return self._request(index, "/health").status == 200
+        except ReplicaUnavailable:
+            return False
+
 
 class Coordinator:
-    def __init__(self, mode: str, replicas: tuple[str, ...], timeout: float, delay: float):
+    def __init__(self, mode: str, replicas: tuple[str, ...], timeout: float, delay: float,
+                 retry_interval: float):
         self.mode = mode
         self.client = ReplicaClient(replicas, timeout)
         self.delay = delay
+        self.retry_interval = retry_interval
         self._round_robin = 0
         self._state_lock = threading.Lock()
         # Mantem a ordem das escritas durante a propagacao assincrona.
         self._write_lock = threading.Lock()
         self._versions: dict[str, int] = {}
         self._replication_queue: queue.Queue[tuple[str, object, int, int] | None] = queue.Queue()
+        # Estado de failover, retry e reconciliacao (usado pelos modos eventual e ryw).
+        replica_count = len(self.client.urls)
+        # Replicas marcadas como fora: nao recebem operacoes ate serem reconciliadas.
+        self._down: set[int] = set()
+        # Atualizacoes que cada replica perdeu: chave -> (valor, versao). So a ultima importa.
+        self._pending: list[dict[str, tuple[object, int]]] = [{} for _ in range(replica_count)]
+        # Ultima versao de cada chave que cada replica confirmou.
+        self._applied: list[dict[str, int]] = [{} for _ in range(replica_count)]
+        # RYW: ultima versao que cada cliente escreveu em cada chave.
+        self._client_versions: dict[str, dict[str, int]] = {}
+        self.counters = {
+            "replicas_marcadas_fora": 0, "failovers_escrita": 0, "failovers_leitura": 0,
+            "propagacoes_adiadas": 0, "atualizacoes_reconciliadas": 0, "reconciliacoes": 0,
+        }
+        self._stop = threading.Event()
         self._worker = threading.Thread(target=self._replicate_worker, daemon=True)
         self._worker.start()
+        self._recovery = threading.Thread(target=self._recovery_worker, daemon=True)
+        self._recovery.start()
 
     def close(self) -> None:
+        self._stop.set()
         self._replication_queue.put(None)
+
+    def _count(self, name: str, amount: int = 1) -> None:
+        with self._state_lock:
+            self.counters[name] += amount
+
+    def _is_down(self, index: int) -> bool:
+        with self._state_lock:
+            return index in self._down
+
+    def _mark_down(self, index: int, reason: str) -> None:
+        with self._state_lock:
+            if index in self._down:
+                return
+            self._down.add(index)
+            self.counters["replicas_marcadas_fora"] += 1
+        print(f"[falha] replica {self.client.urls[index]} marcada como fora ({reason}); "
+              "operacoes vao para as outras replicas")
+
+    def _mark_applied(self, index: int, key: str, version: int) -> None:
+        # Chamado com _write_lock: a replica confirmou esta versao da chave.
+        self._applied[index][key] = version
+        pending = self._pending[index].get(key)
+        if pending is not None and pending[1] <= version:
+            del self._pending[index][key]
+
+    def _candidates(self, first: int) -> list[int]:
+        # Replica preferida primeiro; depois as outras, sempre na mesma ordem.
+        count = len(self.client.urls)
+        return [(first + offset) % count for offset in range(count)]
+
+    def status(self) -> dict:
+        with self._state_lock:
+            down = set(self._down)
+            counters = dict(self.counters)
+        replicas = {
+            url: {"estado": "fora" if index in down else "ok",
+                  "pendentes": len(self._pending[index])}
+            for index, url in enumerate(self.client.urls)
+        }
+        return {"replicas": replicas, "fila_replicacao": self._replication_queue.qsize(),
+                "contadores": counters}
 
     def _replicate_worker(self) -> None:
         while True:
@@ -97,11 +164,66 @@ class Coordinator:
                 for index in range(len(self.client.urls)):
                     if index == source:
                         continue
-                    try:
-                        self.client.write(index, key, value)
-                    except ReplicaUnavailable as exc:
-                        print(f"[replicacao assincrona] {exc}")
+                    self._propagate(index, key, value, version)
             self._replication_queue.task_done()
+
+    def _propagate(self, index: int, key: str, value, version: int) -> None:
+        # Chamado com _write_lock. Se a replica estiver fora, a atualizacao fica
+        # pendente para ser reenviada quando ela voltar (em vez de ser descartada).
+        if not self._is_down(index):
+            try:
+                response = self.client.write(index, key, value)
+                if response.status == 200:
+                    self._mark_applied(index, key, version)
+                    return
+                reason = f"status {response.status}"
+            except ReplicaUnavailable as exc:
+                reason = str(exc)
+            self._mark_down(index, f"replicacao assincrona: {reason}")
+        self._pending[index][key] = (value, version)
+        self._count("propagacoes_adiadas")
+
+    def _recovery_worker(self) -> None:
+        # Retry: a cada intervalo, testa as replicas fora; se responderem, reconcilia.
+        while not self._stop.wait(self.retry_interval):
+            with self._state_lock:
+                down = sorted(self._down)
+            for index in down:
+                if self.client.is_healthy(index):
+                    self._reconcile(index)
+
+    def _reconcile(self, index: int) -> None:
+        # Reenvia as atualizacoes pendentes, uma por vez. Escritas novas continuam
+        # entrando como pendentes, porque a replica so e liberada quando nada faltar.
+        url = self.client.urls[index]
+        print(f"[reconciliacao] replica {url} respondeu /health; "
+              f"reenviando {len(self._pending[index])} atualizacoes pendentes")
+        started, sent = time.monotonic(), 0
+        while True:
+            with self._write_lock:
+                pending = self._pending[index]
+                if not pending:
+                    with self._state_lock:
+                        self._down.discard(index)
+                    break
+                key, (value, version) = next(iter(pending.items()))
+                try:
+                    response = self.client.write(index, key, value)
+                    reason = f"status {response.status}"
+                except ReplicaUnavailable as exc:
+                    response, reason = None, str(exc)
+                if response is None or response.status != 200:
+                    print(f"[reconciliacao] replica {url} falhou de novo ({reason}); "
+                          f"{len(pending)} pendentes, nova tentativa em {self.retry_interval}s")
+                    self._count("atualizacoes_reconciliadas", sent)
+                    return
+                del pending[key]
+                self._applied[index][key] = version
+                sent += 1
+        self._count("atualizacoes_reconciliadas", sent)
+        self._count("reconciliacoes")
+        print(f"[reconciliacao] replica {url} sincronizada: {sent} atualizacoes em "
+              f"{time.monotonic() - started:.1f}s; voltou a receber operacoes")
 
     def _next_replica(self) -> int:
         with self._state_lock:
@@ -136,23 +258,47 @@ class Coordinator:
                 "replicas_confirmadas": len(succeeded), "modo": self.mode,
             }
 
-        source = (self._client_replica(client_id) if self.mode == "ryw"
-                  else self._next_replica())
+        first = (self._client_replica(client_id) if self.mode == "ryw"
+                 else self._next_replica())
+        unavailable = []
         with self._write_lock:
-            try:
-                response = self.client.write(source, key, value)
-            except ReplicaUnavailable as exc:
-                return 503, {"erro": str(exc), "modo": self.mode}
-            if response.status != 200:
-                return 502, {"erro": "a replica recusou a escrita", "detalhes": response.body}
+            # Failover: se a replica escolhida estiver fora, tenta a proxima.
+            for source in self._candidates(first):
+                url = self.client.urls[source]
+                if self._is_down(source):
+                    unavailable.append(url)
+                    continue
+                try:
+                    response = self.client.write(source, key, value)
+                except ReplicaUnavailable as exc:
+                    self._mark_down(source, str(exc))
+                    unavailable.append(url)
+                    continue
+                if response.status >= 500:
+                    self._mark_down(source, f"status {response.status}")
+                    unavailable.append(url)
+                    continue
+                if response.status != 200:
+                    return 502, {"erro": "a replica recusou a escrita", "detalhes": response.body}
+                break
+            else:
+                return 503, {"erro": "nenhuma replica disponivel para a escrita",
+                             "replicas_indisponiveis": unavailable, "modo": self.mode}
             version = self._versions.get(key, 0) + 1
             self._versions[key] = version
+            self._mark_applied(source, key, version)
+            if self.mode == "ryw":
+                self._client_versions.setdefault(client_id, {})[key] = version
             self._replication_queue.put((key, value, source, version))
-        return 200, {
+        body = {
             "mensagem": "valor gravado", "chave": key, "valor": value,
             "replica_confirmada": self.client.urls[source],
             "propagacao": "assincrona", "modo": self.mode,
         }
+        if unavailable:
+            self._count("failovers_escrita")
+            body.update(failover=True, replicas_indisponiveis=unavailable)
+        return 200, body
 
     def read(self, key: str, client_id: str) -> tuple[int, dict]:
         if self.mode == "strong":
@@ -177,15 +323,47 @@ class Coordinator:
                 "replicas_consultadas": len(responses),
             }
 
-        index = (self._client_replica(client_id) if self.mode == "ryw"
+        first = (self._client_replica(client_id) if self.mode == "ryw"
                  else self._next_replica())
-        try:
-            response = self.client.read(index, key)
-        except ReplicaUnavailable as exc:
-            return 503, {"erro": str(exc), "modo": self.mode}
+        # RYW: a replica lida precisa ter pelo menos a ultima escrita deste cliente.
+        min_version = (self._client_versions.get(client_id, {}).get(key, 0)
+                       if self.mode == "ryw" else 0)
+        unavailable, lagging = [], []
+        # Failover: se a replica escolhida estiver fora, tenta a proxima.
+        for index in self._candidates(first):
+            url = self.client.urls[index]
+            if self._is_down(index):
+                unavailable.append(url)
+                continue
+            if self._applied[index].get(key, 0) < min_version:
+                lagging.append(url)
+                continue
+            try:
+                response = self.client.read(index, key)
+            except ReplicaUnavailable as exc:
+                self._mark_down(index, str(exc))
+                unavailable.append(url)
+                continue
+            if response.status >= 500:
+                self._mark_down(index, f"status {response.status}")
+                unavailable.append(url)
+                continue
+            break
+        else:
+            body = {"erro": "nenhuma replica disponivel para a leitura",
+                    "replicas_indisponiveis": unavailable, "modo": self.mode}
+            if lagging:
+                body["replicas_sem_a_escrita_do_cliente"] = lagging
+            return 503, body
         body = dict(response.body)
         body["modo"] = self.mode
         body["replica_consultada"] = self.client.urls[index]
+        if unavailable or lagging:
+            self._count("failovers_leitura")
+            body["failover"] = True
+            body["replicas_indisponiveis"] = unavailable
+            if lagging:
+                body["replicas_sem_a_escrita_do_cliente"] = lagging
         return response.status, body
 
 
@@ -214,8 +392,10 @@ def make_handler(coordinator: Coordinator):
 
         def do_GET(self) -> None:  # noqa: N802
             if urlparse(self.path).path == "/health":
-                self._json(200, {"status": "ok", "servico": "coordenador",
-                                 "modo": coordinator.mode})
+                body = {"status": "ok", "servico": "coordenador", "modo": coordinator.mode}
+                if coordinator.mode != "strong":
+                    body.update(coordinator.status())
+                self._json(200, body)
                 return
             key = self._read_key()
             if key is None:
@@ -264,13 +444,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument("--replication-delay", type=float, default=1.0,
                         help="atraso da propagacao assincrona, em segundos")
+    parser.add_argument("--retry-interval", type=float, default=1.0,
+                        help="intervalo para testar replicas fora e reconcilia-las, em segundos")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     coordinator = Coordinator(args.mode, tuple(args.replicas), args.timeout,
-                              max(0, args.replication_delay))
+                              max(0, args.replication_delay), max(0.1, args.retry_interval))
     server = ThreadingHTTPServer((args.host, args.port), make_handler(coordinator))
     print(f"Coordenador em http://{args.host}:{args.port} (modo: {args.mode})")
     print("Replicas: " + ", ".join(args.replicas))

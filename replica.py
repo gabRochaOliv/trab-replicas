@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -15,6 +16,11 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 class DataStore:
     """Armazenamento JSON persistente e seguro para acesso por varias threads."""
+
+    # No Windows, antivirus/indexador podem manter o JSON aberto por alguns
+    # milissegundos e fazer os.replace falhar com PermissionError.
+    REPLACE_ATTEMPTS = 5
+    REPLACE_WAIT = 0.05
 
     def __init__(self, path: Path):
         self.path = path
@@ -44,13 +50,26 @@ class DataStore:
                 file.write("\n")
                 file.flush()
                 os.fsync(file.fileno())
-            os.replace(temporary_name, self.path)
+            self._replace(temporary_name)
         except Exception:
             try:
                 os.unlink(temporary_name)
             except FileNotFoundError:
                 pass
             raise
+
+    def _replace(self, temporary_name: str) -> None:
+        # Tenta de novo algumas vezes; se o arquivo continuar bloqueado, o erro sobe.
+        for attempt in range(1, self.REPLACE_ATTEMPTS + 1):
+            try:
+                os.replace(temporary_name, self.path)
+                return
+            except PermissionError as exc:
+                if attempt == self.REPLACE_ATTEMPTS:
+                    raise
+                print(f"[aviso] {self.path} bloqueado ({exc}); tentativa {attempt} "
+                      f"de {self.REPLACE_ATTEMPTS}")
+                time.sleep(self.REPLACE_WAIT * attempt)
 
     def read(self, key: str):
         with self._lock:
@@ -132,7 +151,8 @@ def make_handler(store: DataStore, replica_id: str):
             key = key.strip()
             try:
                 store.write(key, payload["valor"])
-            except RuntimeError as exc:
+            except (RuntimeError, OSError) as exc:
+                # Responde 500 em vez de derrubar a conexao, para o coordenador saber o motivo.
                 self._json(500, {"erro": str(exc)})
                 return
             self._json(

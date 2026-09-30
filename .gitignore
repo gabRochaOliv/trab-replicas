@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+
+*.md
+!README.md
+!RESULTADOS.md
+*.txt
+backup_*/
+logs_testes/
